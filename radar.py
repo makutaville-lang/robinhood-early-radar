@@ -1,9 +1,9 @@
-
 import os
 import time
 import json
 import sqlite3
 import logging
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import requests
@@ -104,68 +104,59 @@ def load_watchlist() -> List[str]:
             out.append(s)
     return out
 
-def discover_recent_tokens(pages: int = 4) -> Dict[str, dict]:
-    """Discover ERC-20s from recent Robinhood Chain token transfers."""
+def _gt_pools(endpoint: str, pages: int = 2) -> Dict[str, dict]:
+    """Discover Robinhood tokens via GeckoTerminal public API."""
     tokens = {}
-    params = {}
-    for _ in range(pages):
+    headers = {
+        "accept": "application/json",
+        "Accept": "application/json;version=20230203",
+    }
+    for page in range(1, pages + 1):
         try:
-            data = get_json(f"{BLOCKSCOUT}/token-transfers", params=params)
+            r = session.get(
+                f"https://api.geckoterminal.com/api/v2/networks/robinhood/{endpoint}",
+                params={"page": page, "include": "base_token"},
+                headers=headers,
+                timeout=20,
+            )
+            r.raise_for_status()
+            payload = r.json()
         except Exception as e:
-            log.warning("Blockscout transfer discovery failed: %s", e)
+            log.warning("GeckoTerminal %s discovery failed: %s", endpoint, e)
             break
-        for item in data.get("items", []):
-            token = item.get("token") or {}
-            ttype = str(token.get("type", "")).upper()
-            if "ERC-20" not in ttype and "ERC20" not in ttype:
+        included = {}
+        for item in payload.get("included", []) or []:
+            if item.get("type") == "token":
+                included[item.get("id")] = item
+        for pool in payload.get("data", []) or []:
+            rel = ((pool.get("relationships") or {}).get("base_token") or {}).get("data") or {}
+            token_id = rel.get("id") or ""
+            if not token_id.startswith("robinhood_"):
                 continue
-            addr = token.get("address_hash") or token.get("address")
-            if addr and addr.startswith("0x") and len(addr) == 42:
+            addr = token_id.replace("robinhood_", "", 1)
+            meta = included.get(token_id, {})
+            attrs = meta.get("attributes") or {}
+            if addr.startswith("0x") and len(addr) == 42:
                 tokens[addr.lower()] = {
                     "address": addr,
-                    "symbol": token.get("symbol") or "?",
-                    "name": token.get("name") or "?",
+                    "symbol": attrs.get("symbol") or "?",
+                    "name": attrs.get("name") or "?",
                 }
-        nxt = data.get("next_page_params")
-        if not nxt:
-            break
-        params = nxt
+        time.sleep(0.35)
     return tokens
 
-def discover_token_list(pages: int = 3) -> Dict[str, dict]:
-    """Secondary discovery source from Blockscout's token list."""
+def discover_recent_tokens(pages: int = 2) -> Dict[str, dict]:
+    return _gt_pools("new_pools", pages=pages)
+
+def discover_token_list(pages: int = 2) -> Dict[str, dict]:
     tokens = {}
-    params = {"type": "ERC-20"}
-    for _ in range(pages):
-        try:
-            data = get_json(f"{BLOCKSCOUT}/tokens", params=params)
-        except Exception as e:
-            log.warning("Blockscout token-list discovery failed: %s", e)
-            break
-        for token in data.get("items", []):
-            addr = token.get("address_hash") or token.get("address")
-            if addr and addr.startswith("0x") and len(addr) == 42:
-                tokens[addr.lower()] = {
-                    "address": addr,
-                    "symbol": token.get("symbol") or "?",
-                    "name": token.get("name") or "?",
-                }
-        nxt = data.get("next_page_params")
-        if not nxt:
-            break
-        params = {"type": "ERC-20", **nxt}
+    tokens.update(_gt_pools("pools", pages=pages))
+    tokens.update(_gt_pools("trending_pools", pages=1))
     return tokens
 
 def get_holders(address: str) -> int:
-    try:
-        data = get_json(f"{BLOCKSCOUT}/tokens/{address}/counters")
-        return int(data.get("token_holders_count") or 0)
-    except Exception:
-        try:
-            data = get_json(f"{BLOCKSCOUT}/tokens/{address}")
-            return int(data.get("holders_count") or 0)
-        except Exception:
-            return 0
+    # Blockscout currently returns 403 from some Railway egress IPs.
+    return 0
 
 def dex_pairs_batch(addresses: List[str]) -> List[dict]:
     """DEX Screener supports up to 30 token addresses per request."""
