@@ -10,10 +10,8 @@ import requests
 
 # ---------------- CONFIG ----------------
 CHAIN = os.getenv("CHAIN", "robinhood")
-BLOCKSCOUT = os.getenv("BLOCKSCOUT", "https://robinhoodchain.blockscout.com/api/v2")
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))  # 5 minutes
 
-# Discovery + ranking thresholds. Designed to catch moves BEFORE +100% whenever possible.
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "40000"))
 MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "75000"))
 MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "20000000"))
@@ -25,10 +23,7 @@ COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "60"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Always monitor these contracts even if they do not appear in recent transfer discovery.
-# Add one contract per line in watchlist.txt.
 WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", "watchlist.txt")
-
 DB_FILE = os.getenv("DB_FILE", "radar.db")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -39,7 +34,7 @@ logging.basicConfig(
 log = logging.getLogger("radar")
 
 session = requests.Session()
-session.headers.update({"User-Agent": "RobinhoodEarlyRadar/1.0"})
+session.headers.update({"User-Agent": "RobinhoodEarlyRadar/1.1"})
 
 def now_ts() -> int:
     return int(time.time())
@@ -52,8 +47,8 @@ def safe_float(v, default=0.0):
     except Exception:
         return default
 
-def get_json(url: str, params=None, timeout=20):
-    r = session.get(url, params=params, timeout=timeout)
+def get_json(url: str, params=None, timeout=20, headers=None):
+    r = session.get(url, params=params, timeout=timeout, headers=headers)
     r.raise_for_status()
     return r.json()
 
@@ -105,7 +100,6 @@ def load_watchlist() -> List[str]:
     return out
 
 def _gt_pools(endpoint: str, pages: int = 2) -> Dict[str, dict]:
-    """Discover Robinhood tokens via GeckoTerminal public API."""
     tokens = {}
     headers = {
         "accept": "application/json",
@@ -113,21 +107,21 @@ def _gt_pools(endpoint: str, pages: int = 2) -> Dict[str, dict]:
     }
     for page in range(1, pages + 1):
         try:
-            r = session.get(
+            payload = get_json(
                 f"https://api.geckoterminal.com/api/v2/networks/robinhood/{endpoint}",
                 params={"page": page, "include": "base_token"},
                 headers=headers,
                 timeout=20,
             )
-            r.raise_for_status()
-            payload = r.json()
         except Exception as e:
             log.warning("GeckoTerminal %s discovery failed: %s", endpoint, e)
             break
+
         included = {}
         for item in payload.get("included", []) or []:
             if item.get("type") == "token":
                 included[item.get("id")] = item
+
         for pool in payload.get("data", []) or []:
             rel = ((pool.get("relationships") or {}).get("base_token") or {}).get("data") or {}
             token_id = rel.get("id") or ""
@@ -155,14 +149,12 @@ def discover_token_list(pages: int = 2) -> Dict[str, dict]:
     return tokens
 
 def get_holders(address: str) -> int:
-    # Blockscout currently returns 403 from some Railway egress IPs.
     return 0
 
 def dex_pairs_batch(addresses: List[str]) -> List[dict]:
-    """DEX Screener supports up to 30 token addresses per request."""
     all_pairs = []
     for i in range(0, len(addresses), 30):
-        batch = addresses[i:i+30]
+        batch = addresses[i:i + 30]
         url = f"https://api.dexscreener.com/tokens/v1/{CHAIN}/" + ",".join(batch)
         try:
             data = get_json(url)
@@ -210,7 +202,6 @@ def snapshot_from_pair(p: dict, holders: int) -> dict:
         "price_h6": safe_float(pc.get("h6")),
         "price_h24": safe_float(pc.get("h24")),
         "holders": holders,
-        "pair_created_at": int(p.get("pairCreatedAt") or 0),
         "url": p.get("url") or "",
     }
 
@@ -247,9 +238,7 @@ def score_token(s: dict, prev15: Optional[dict]) -> Tuple[int, List[str]]:
     v6 = s["volume_h6"]
     buys = s["buys_h1"]
     sells = s["sells_h1"]
-    holders = s["holders"]
 
-    # Hard quality gates handled separately, score is momentum + quality.
     if 3 <= p1 < 10:
         score += 8; why.append(f"1h +{p1:.1f}%")
     elif 10 <= p1 < 25:
@@ -271,7 +260,6 @@ def score_token(s: dict, prev15: Optional[dict]) -> Tuple[int, List[str]]:
     elif p24 > 120:
         score += 3; why.append(f"24h +{p24:.0f}% (chase risk)")
 
-    # Turnover matters: high volume relative to liquidity and market cap.
     if liq > 0 and v1 / liq >= 0.15:
         score += 8; why.append(f"1h vol/liquidity {v1/liq:.2f}x")
     if mc > 0 and v6 / mc >= 0.15:
@@ -286,26 +274,17 @@ def score_token(s: dict, prev15: Optional[dict]) -> Tuple[int, List[str]]:
     if total >= 40:
         score += 4; why.append(f"{total} 1h transactions")
 
-    if holders >= 100:
-        score += 3; why.append(f"{holders:,} holders")
-    if holders >= 500:
-        score += 3
-
     if prev15:
         liq_growth = pct_change(liq, prev15.get("liquidity", 0))
-        holder_growth = pct_change(holders, prev15.get("holders", 0))
         v1_growth = pct_change(v1, prev15.get("volume_h1", 0))
         price_growth = pct_change(s["price"], prev15.get("price", 0))
         if liq_growth >= 5:
             score += 10; why.append(f"liquidity +{liq_growth:.1f}%/15m")
-        if holder_growth >= 3:
-            score += 8; why.append(f"holders +{holder_growth:.1f}%/15m")
         if v1_growth >= 20:
             score += 9; why.append(f"1h-volume pace +{v1_growth:.0f}%/15m")
         if 2 <= price_growth <= 15:
             score += 7; why.append(f"price +{price_growth:.1f}%/15m")
 
-    # Penalize obvious late-stage vertical moves.
     if p24 > 250:
         score -= 10
     if p6 > 250:
@@ -340,7 +319,6 @@ def store_snapshot(con, s: dict):
         s["volume_h1"],s["volume_h6"],s["volume_h24"],s["buys_h1"],s["sells_h1"],
         s["price_h1"],s["price_h6"],s["price_h24"],s["holders"]
     ))
-    # Keep ~14 days at 5-min frequency without unbounded growth.
     con.execute("DELETE FROM snapshots WHERE ts < ?", (ts - 14*86400,))
     con.commit()
 
@@ -353,7 +331,6 @@ def can_alert(con, address: str, score: int) -> bool:
         return True
     last_ts, last_score = row
     elapsed = now_ts() - last_ts
-    # Allow a faster re-alert if score materially strengthens.
     return elapsed >= COOLDOWN_MINUTES*60 or score >= last_score + 12
 
 def mark_alert(con, address: str, score: int):
@@ -385,7 +362,7 @@ def format_alert(s: dict, score: int, why: List[str]) -> str:
         f"MC/FDV: {money(s['market_cap'])} | Liquidity: {money(s['liquidity'])}\n"
         f"Change: 1h {s['price_h1']:+.1f}% | 6h {s['price_h6']:+.1f}% | 24h {s['price_h24']:+.1f}%\n"
         f"Volume: 1h {money(s['volume_h1'])} | 6h {money(s['volume_h6'])} | 24h {money(s['volume_h24'])}\n"
-        f"1h buys/sells: {s['buys_h1']}/{s['sells_h1']} ({br:.0%} buys) | holders: {s['holders']:,}\n"
+        f"1h buys/sells: {s['buys_h1']}/{s['sells_h1']} ({br:.0%} buys)\n"
         f"Why: {', '.join(why[:7])}\n"
         f"Contract: {s['address']}\n"
         f"{s['url']}\n"
@@ -409,8 +386,12 @@ def run_cycle(con):
     discovered = {}
     discovered.update(discover_recent_tokens())
     discovered.update(discover_token_list())
+
     for addr in load_watchlist():
-        discovered.setdefault(addr.lower(), {"address": addr, "symbol": "WATCH", "name": "Watchlist"})
+        discovered.setdefault(
+            addr.lower(),
+            {"address": addr, "symbol": "WATCH", "name": "Watchlist"},
+        )
 
     addresses = [v["address"] for v in discovered.values()]
     if not addresses:
@@ -423,10 +404,10 @@ def run_cycle(con):
     log.info("DEX data found for %d candidates", len(best))
 
     ranked = []
-    for addr_lower, p in best.items():
+    for _, p in best.items():
         liq = safe_float((p.get("liquidity") or {}).get("usd"))
         mc = safe_float(p.get("marketCap")) or safe_float(p.get("fdv"))
-        # Skip holder query for clearly irrelevant pairs to keep calls light.
+
         if liq < MIN_LIQUIDITY_USD * 0.5:
             continue
         if mc and mc > MAX_MARKET_CAP_USD * 1.5:
@@ -439,14 +420,16 @@ def run_cycle(con):
         score, why = score_token(s, prev)
         ok, reason = quality_gate(s)
         store_snapshot(con, s)
+
         if ok:
             ranked.append((score, s, why))
         else:
             log.debug("Gate %s: %s", s["symbol"], reason)
 
     ranked.sort(key=lambda x: x[0], reverse=True)
+
     if ranked:
-        top = ", ".join(f"{s['symbol']}:{score}" for score,s,_ in ranked[:8])
+        top = ", ".join(f"{s['symbol']}:{score}" for score, s, _ in ranked[:8])
         log.info("Top radar: %s", top)
 
     for score, s, why in ranked:
@@ -461,8 +444,14 @@ def run_cycle(con):
 
 def main():
     con = init_db()
-    log.info("Robinhood Early Radar started | poll=%ss | early=%d high=%d", POLL_SECONDS, EARLY_SCORE, HIGH_SCORE)
-    log.info("Data sources: Robinhood Blockscout + DEX Screener")
+    log.info(
+        "Robinhood Early Radar started | poll=%ss | early=%d high=%d",
+        POLL_SECONDS,
+        EARLY_SCORE,
+        HIGH_SCORE,
+    )
+    log.info("Data sources: GeckoTerminal + DEX Screener")
+
     while True:
         started = time.time()
         try:
@@ -471,6 +460,7 @@ def main():
             raise
         except Exception:
             log.exception("Cycle failed")
+
         elapsed = time.time() - started
         time.sleep(max(5, POLL_SECONDS - elapsed))
 
