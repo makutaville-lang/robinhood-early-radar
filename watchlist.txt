@@ -1,0 +1,4 @@
+# Optional: paste Robinhood Chain ERC-20 contracts here, one per line.
+# The scanner discovers tokens automatically; this file forces extra monitoring.
+# POOLS example:
+0x385b36Ff682Ab4C76E7c37A66b96aABC466471d5
